@@ -61,7 +61,7 @@ class FakeJupyterHub(JupyterHub):
                 resp = yield client.fetch(req)
             except Exception as e:
                 print("Failed", e)
-                IOLoop.current.stop()
+                IOLoop.current().stop()
                 raise
             times.append(time.perf_counter() - tic)
             users = json.loads(resp.body.decode('utf8'))
@@ -137,6 +137,7 @@ def main():
     p = Popen(['configurable-http-proxy', '--log-level=error',
         '--default-target', 'http://127.0.0.1:8081'])
     atexit.register(lambda *args: p.terminate())
+    time.sleep(1)
 
     print("users, active, running, startup, spawn, first_users, second_users")
     for n in [10, 50, 100, 500, 1000, 2000, 5000]:
