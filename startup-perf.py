@@ -55,7 +55,6 @@ class FakeJupyterHub(JupyterHub):
         yield client.fetch('http://127.0.0.1:8081/hub/api')
         self.users_times = times = []
         for i in range(2):
-            yield gen.sleep(1)
             tic = time.perf_counter()
             try:
                 resp = yield client.fetch(req)
