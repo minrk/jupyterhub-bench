@@ -51,6 +51,8 @@ class FakeJupyterHub(JupyterHub):
         client = AsyncHTTPClient()
         req = HTTPRequest('http://127.0.0.1:8081/hub/api/users',
             headers={'Authorization': f"token {admin_token}"})
+        # make an initial request to ensure the Hub is warmed up
+        yield client.fetch('http://127.0.0.1:8081/hub/api')
         self.users_times = times = []
         for i in range(2):
             yield gen.sleep(1)
