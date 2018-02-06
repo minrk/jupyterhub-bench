@@ -138,9 +138,9 @@ def main():
     atexit.register(lambda *args: p.terminate())
     time.sleep(1)
 
-    for n in [10, 50, 100, 500, 1000, 2000, 5000]:
-        for frac in [0, 0.1, 0.25, 0.5, 1]:
     print("users,active,running,startup,spawn,first_users,second_users")
+    for n in [10, 50, 100, 500, 1000, 2000, 5000]:
+        for frac in [0, 0.25, 1]:
             r = int(frac * n)
             pool = ProcessPoolExecutor(1)
             f = pool.submit(run_test, n, r)
