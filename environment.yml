@@ -1,0 +1,4 @@
+dependencies:
+  - bokeh
+  - matplotlib
+  - pandas
