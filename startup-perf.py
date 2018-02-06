@@ -69,10 +69,12 @@ class FakeJupyterHub(JupyterHub):
         loop.add_callback(loop.stop)
         # loop.stop()
 
+    @gen.coroutine
     def start(self):
+        # print(f"{len(list(self.db))} ORM objects at startup", file=sys.stderr)
+        yield super().start()
         self.start_toc = time.perf_counter()
-        IOLoop.current().call_later(1, lambda : self.get_users())
-        return super().start()
+        IOLoop.current().add_callback(self.get_users)
 
     @gen.coroutine
     def init_spawners(self):
