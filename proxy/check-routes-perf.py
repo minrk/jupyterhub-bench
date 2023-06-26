@@ -40,6 +40,7 @@ class FakeProxy(Proxy):
     routes = Dict()
     @gen.coroutine
     def get_all_routes(self):
+        yield gen.moment
         return self.routes
 
     @gen.coroutine
