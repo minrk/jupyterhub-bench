@@ -2,3 +2,9 @@ jupyterhub_cookie_secret
 jupyterhub.sqlite
 .DS_Store
 .ipynb_checkpoints
+
+__pycache__
+
+# asv
+project
+env
