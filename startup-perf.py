@@ -1,32 +1,40 @@
-from binascii import b2a_hex
-from concurrent.futures import ProcessPoolExecutor
+import asyncio
 import json
 import logging
 import os
 import random
-from subprocess import Popen
 import tempfile
 import time
+from binascii import b2a_hex
+from concurrent.futures import ProcessPoolExecutor
+from subprocess import Popen
 
-from tornado import gen
-from tornado.httpclient import AsyncHTTPClient, HTTPRequest
-from tornado.ioloop import IOLoop
-
+from traitlets.config import Config
 from jupyterhub import orm
 from jupyterhub.app import JupyterHub
-from jupyterhub.auth import Authenticator
 from jupyterhub.spawner import LocalProcessSpawner
-
+from tornado.httpclient import AsyncHTTPClient, HTTPRequest
+from tornado.httputil import url_concat
+from tornado.ioloop import IOLoop
+from sqlalchemy import event
 
 # silence alembic logging
 logging.getLogger('alembic').parent = None
 
 
-class FakePollSpawner(LocalProcessSpawner):
-    @gen.coroutine
-    def poll(self):
-        yield gen.moment
+class FakeSpawner(LocalProcessSpawner):
+    """Empty spawner that does nothing"""
+
+    _stopped = False
+
+    async def poll(self):
+        if self._stopped:
+            return 0
+        await asyncio.sleep(0)
         return None
+
+    async def stop(self):
+        self._stopped = True
 
 
 admin_token = b2a_hex(os.urandom(16)).decode('ascii')
@@ -34,53 +42,89 @@ admin_token = b2a_hex(os.urandom(16)).decode('ascii')
 
 class FakeJupyterHub(JupyterHub):
 
-    authenticator_class = Authenticator
-    spawner_class = FakePollSpawner
-    log_level = logging.ERROR
+    async def api_request(self, client, path, params=None):
+        url = url_concat(self.hub.api_url + path, params or {})
+        req = HTTPRequest(
+            url,
+            headers={
+                "Authorization": f"token {admin_token}",
+                "Accept": "application/jupyterhub-pagination+json",
+            },
+        )
+        self.log.info("Fetching %s", url)
+        resp = await client.fetch(req)
+        return json.loads(resp.body.decode())
 
-    services = [
-        {
-            'name': 'admin',
-            'admin': True,
-            'api_token': admin_token,
-        }
-    ]
-
-    @gen.coroutine
-    def get_users(self):
+    async def get_users(self):
         client = AsyncHTTPClient()
-        req = HTTPRequest('http://127.0.0.1:8081/hub/api/users',
-            headers={'Authorization': f"token {admin_token}"})
         # make an initial request to ensure the Hub is warmed up
-        yield client.fetch('http://127.0.0.1:8081/hub/api')
+        await client.fetch(self.hub.api_url)
         self.users_times = times = []
         for i in range(2):
             tic = time.perf_counter()
-            try:
-                resp = yield client.fetch(req)
-            except Exception as e:
-                print("Failed", e)
-                IOLoop.current().stop()
-                raise
+            next = None
+            user_info = await self.api_request(client, "/users")
+            while user_info["_pagination"]["next"]:
+                user_info = await self.api_request(
+                    client,
+                    "/users",
+                    {"offset": user_info["_pagination"]["next"]["offset"]},
+                )
             times.append(time.perf_counter() - tic)
-            users = json.loads(resp.body.decode('utf8'))
-        loop = IOLoop.current()
-        # yield self.cleanup()
-        loop.add_callback(loop.stop)
-        # loop.stop()
 
-    @gen.coroutine
-    def start(self):
-        # print(f"{len(list(self.db))} ORM objects at startup", file=sys.stderr)
-        yield super().start()
+    def init_db(self):
+        result = super().init_db()
+        engine = self.db.get_bind()
+
+        @event.listens_for(engine, "before_execute")
+        def before_execute(conn, clauseelement, multiparams, params, execution_options):
+            # simulate 'slow' database performance by adding 1ms to each db execution
+            time.sleep(1e-3)
+
+        return result
+
+    async def start(self):
+        await super().start()
         self.start_toc = time.perf_counter()
-        IOLoop.current().add_callback(self.get_users)
+        self.log.info("Awaiting init spawners")
+        await self._init_spawners_done
+        self.log.info("Awaiting get users")
+        await self.get_users()
+        self.log.info("done")
 
-    @gen.coroutine
-    def init_spawners(self):
+    async def init_spawners(self):
+        self._init_spawners_done = asyncio.Future()
         tic = time.perf_counter()
-        yield super().init_spawners()
-        self.spawn_time = time.perf_counter() - tic
+        try:
+            result = await super().init_spawners()
+        except Exception as e:
+            self._init_spawners_done.set_exception(e)
+            raise
+        else:
+            self._init_spawners_done.set_result(None)
+            self.spawn_time = time.perf_counter() - tic
+            return result
+
+
+c = config = Config()
+c.Proxy.should_start = False
+c.JupyterHub.log_level = logging.ERROR
+c.JupyterHub.spawner_class = FakeSpawner
+c.JupyterHub.authenticator_class = "null"
+c.JupyterHub.cleanup_servers = False
+
+# make sure these are explicit
+# because this is what costs a lot
+c.Authenticator.admin_users = {"admin"}
+c.Authenticator.allowed_users = {"admin"}
+
+c.JupyterHub.services = [
+    {
+        "name": "admin",
+        "api_token": admin_token,
+    }
+]
+c.JupyterHub.load_roles = [{"name": "admin", "services": ["admin"]}]
 
 
 def add_users(db, nusers, nrunning):
@@ -89,54 +133,57 @@ def add_users(db, nusers, nrunning):
     There will be nusers total, and nrunning will have a running server
     """
     running_indices = set(random.choices(range(nusers), k=nrunning))
-    user = orm.User(name='admin', admin=True)
-    db.add(user)
-    db.commit()
-    admin_token = user.new_api_token()
 
-    for i in range(nusers-1):
+    user_role = orm.Role.find(db, "user")
+    for i in range(nusers):
         name = f"user-{i}"
         user = orm.User(name=name)
         db.add(user)
+        user.roles.append(user_role)
         spawner = orm.Spawner(user=user, name='')
         db.add(spawner)
         if i in running_indices:
-            spawner.server = orm.Server(port=i)
+            # put them all proxy port so health checks hit proxy
+            spawner.server = orm.Server(ip="127.0.0.1", port=8001)
     db.commit()
-    return admin_token
 
 
 def run_test(nusers, nrunning):
-    # import signal
-    # signal.signal(signal.SIGINT, signal.SIG_IGN)
-    # fixes for 0.8.1's AsyncIOMainLoop installation,
-    # which isn't fork-safe
-    # we have to tear everything down and create a new eventloop
-    if hasattr(IOLoop, 'clear_instance'):
-        IOLoop.clear_instance()
-    IOLoop.clear_current()
-    import asyncio
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    # from tornado.platform.asyncio import AsyncIOMainLoop
-    # AsyncIOMainLoop().install()
-
     with tempfile.TemporaryDirectory() as td:
         db_file = os.path.join(td, 'jupyterhub.sqlite')
         db_url = f"sqlite:///{db_file}"""
-        FakeJupyterHub.db_url = db_url
+        JupyterHub.clear_instance()
+        # init db by initializing (but not launching) a Hub
+        hub = JupyterHub.instance(
+            db_url=db_url,
+            config=config,
+        )
+        asyncio.run(hub.initialize([]))
+        JupyterHub.clear_instance()
         db = orm.new_session_factory(db_url)()
         add_users(db, nusers, nrunning)
+        FakeJupyterHub.clear_instance()
         tic = time.perf_counter()
-        FakeJupyterHub.launch_instance(['--Proxy.should_start=False'])
-        hub = FakeJupyterHub.instance()
+        hub = FakeJupyterHub.instance(db_url=db_url, config=config)
+
+        asyncio.run(hub.launch_instance_async([]))
         return hub.start_toc - tic, hub.spawn_time, hub.users_times
 
 
 def main():
     import atexit
-    os.environ['CONFIGPROXY_AUTH_TOKEN'] = 'proxy-token'
-    p = Popen(['configurable-http-proxy', '--log-level=error',
-        '--default-target', 'http://127.0.0.1:8081'])
+
+    os.environ["CONFIGPROXY_AUTH_TOKEN"] = "proxy-token"
+    p = Popen(
+        [
+            "configurable-http-proxy",
+            "--log-level=error",
+            "--default-target",
+            "http://127.0.0.1:8081",
+            "--api-ip",
+            "127.0.0.1",
+        ]
+    )
     atexit.register(lambda *args: p.terminate())
     time.sleep(1)
 

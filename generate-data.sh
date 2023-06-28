@@ -2,17 +2,28 @@
 # generate csv data for each commit since branching
 set -eux
 
-BASE_REF=dde7b5ea68989b47f4f588a99148fe6cc70f3d29
-BRANCH=startup-lite
+BASE_REF="${BASE_REF:-origin/main}"
+BRANCH="${BRANCH:-quicker-startup}"
 JUPYTERHUB="${JUPYTERHUB:-$HOME/dev/jpy/jupyterhub}"
-HERE=$PWD
+HERE=$(dirname "$(realpath "$0")")
 
 cd "$JUPYTERHUB"
 git diff --exit-code
 git diff --cached --exit-code
 
-refs="$BASE_REF $(git rev-list $BASE_REF..$BRANCH)"
+if [[ -z "$@" ]]; then
+  refs="$(git show -s --format=%H $BASE_REF) $(git rev-list $BASE_REF..$BRANCH)"
+else
+  refs=""
+  for ref in "$@"; do
+    refs="$refs $(git show -s --format=%H $ref)"
+  done
+fi
+echo "Running for $refs"
+current_branch=$(git branch --show-current)
+
 cd "$HERE"
+
 
 for ref in $refs; do
     csv="${ref:0:7}.csv"
@@ -26,3 +37,6 @@ for ref in $refs; do
     cd "$HERE"
     python startup-perf.py | tee $csv
 done
+
+cd "$JUPYTERHUB"
+git switch "$current_branch"
